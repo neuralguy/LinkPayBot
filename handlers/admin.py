@@ -5,10 +5,10 @@ from aiogram.fsm.context import FSMContext
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 
-from bot.database.models import Payment, User, BotSettings
-from bot.states.payment import AdminStates
-from bot.keyboards.inline import get_admin_settings_keyboard, get_cancel_keyboard
-from bot.config import settings
+from database.models import Payment, User, BotSettings
+from states.payment import AdminStates
+from keyboards.inline import get_admin_settings_keyboard, get_cancel_keyboard
+from config import settings
 
 router = Router()
 
