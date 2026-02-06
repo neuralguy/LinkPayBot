@@ -5,11 +5,13 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from config import settings
 from database.db import init_db
 from handlers import user, admin
 from middlewares.db import DbSessionMiddleware
+from scheduler import check_expired_subscriptions
 
 
 async def main():
@@ -22,7 +24,7 @@ async def main():
 
     bot = Bot(
         token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
 
     dp = Dispatcher(storage=MemoryStorage())
@@ -31,6 +33,19 @@ async def main():
 
     dp.include_router(admin.router)
     dp.include_router(user.router)
+
+    # === ПЛАНИРОВЩИК: проверка подписок каждые 60 минут ===
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        check_expired_subscriptions,
+        trigger="interval",
+        minutes=60,
+        args=[bot, session_maker],
+        id="check_subscriptions",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logging.info("Планировщик запущен — проверка подписок каждые 60 минут")
 
     logging.info("Бот запущен")
     await bot.delete_webhook(drop_pending_updates=True)

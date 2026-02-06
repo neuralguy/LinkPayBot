@@ -5,11 +5,13 @@ from aiogram import Bot, Dispatcher
 from aiogram.client.default import DefaultBotProperties
 from aiogram.enums import ParseMode
 from aiogram.fsm.storage.memory import MemoryStorage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
 
 from bot.config import settings
-from bot.database.db import init_db, get_session_maker
+from bot.database.db import init_db
 from bot.handlers import user, admin
 from bot.middlewares.db import DbSessionMiddleware
+from bot.scheduler import check_expired_subscriptions
 
 
 async def main():
@@ -17,26 +19,33 @@ async def main():
         level=logging.INFO,
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
-    
-    # Инициализация базы данных
+
     session_maker = await init_db()
-    
-    # Инициализация бота
+
     bot = Bot(
         token=settings.bot_token,
-        default=DefaultBotProperties(parse_mode=ParseMode.HTML)
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
     )
-    
+
     dp = Dispatcher(storage=MemoryStorage())
-    
-    # Регистрация middleware
+
     dp.update.middleware(DbSessionMiddleware(session_maker))
-    
-    # Регистрация роутеров
+
     dp.include_router(admin.router)
     dp.include_router(user.router)
-    
-    # Запуск бота
+
+    # === ПЛАНИРОВЩИК ===
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        check_expired_subscriptions,
+        trigger="interval",
+        minutes=60,
+        args=[bot, session_maker],
+        id="check_subscriptions",
+        replace_existing=True,
+    )
+    scheduler.start()
+
     await bot.delete_webhook(drop_pending_updates=True)
     await dp.start_polling(bot)
 

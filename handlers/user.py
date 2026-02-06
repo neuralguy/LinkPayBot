@@ -1,3 +1,5 @@
+from datetime import datetime, timezone
+
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import CommandStart
@@ -13,18 +15,27 @@ from config import settings
 router = Router()
 
 
-async def get_or_create_user(session: AsyncSession, telegram_id: int, username: str | None, full_name: str) -> User:
+async def get_or_create_user(
+    session: AsyncSession, telegram_id: int, username: str | None, full_name: str
+) -> User:
     result = await session.execute(
         select(User).where(User.telegram_id == telegram_id)
     )
     user = result.scalar_one_or_none()
-    
+
     if not user:
-        user = User(telegram_id=telegram_id, username=username, full_name=full_name)
+        user = User(
+            telegram_id=telegram_id, username=username, full_name=full_name
+        )
         session.add(user)
         await session.commit()
         await session.refresh(user)
-    
+    else:
+        # Обновляем имя/юзернейм на случай, если изменились
+        user.username = username
+        user.full_name = full_name
+        await session.commit()
+
     return user
 
 
@@ -50,16 +61,28 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext):
     card_number = await get_setting(session, "card_number")
     phone_number = await get_setting(session, "phone_number")
     amount = await get_setting(session, "amount")
-    
+
+    # Показываем статус подписки, если есть
+    now = datetime.now(timezone.utc)
+    if user.subscription_until and user.subscription_until > now:
+        expire_str = user.subscription_until.strftime("%d.%m.%Y %H:%M UTC")
+        sub_info = (
+            f"✅ <b>У вас активная подписка</b> до <b>{expire_str}</b>\n\n"
+            f"Вы можете продлить подписку заранее — новый срок прибавится к текущему.\n\n"
+        )
+    else:
+        sub_info = "❌ <b>У вас нет активной подписки.</b>\n\n"
+
     text = (
         f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
-        f"📋 <b>Информация для оплаты:</b>\n\n"
+        f"{sub_info}"
+        f"📋 <b>Информация для оплаты подписки на месяц:</b>\n\n"
         f"💳 <b>Номер карты:</b>\n<code>{card_number}</code>\n\n"
         f"📱 <b>Номер телефона:</b>\n<code>{phone_number}</code>\n\n"
         f"💰 <b>Сумма к оплате:</b> <b>{amount} ₽</b>\n\n"
         f"После оплаты нажмите кнопку ниже и отправьте скриншот/фото чека."
     )
-    
+
     await message.answer(text, reply_markup=get_payment_confirm_keyboard())
 
 
@@ -87,25 +110,28 @@ async def process_payment_photo(message: Message, session: AsyncSession, state: 
     photo_file_id = message.photo[-1].file_id
     
     # Сохраняем платёж
-    payment = Payment(user_id=user.id, photo_file_id=photo_file_id, status="pending")
+    payment = Payment(
+        user_id=user.id, photo_file_id=photo_file_id, status="pending"
+    )
     session.add(payment)
     await session.commit()
     await session.refresh(payment)
-    
+
     await state.clear()
-    
+
     await message.answer(
         "✅ <b>Фото получено!</b>\n\n"
         "Ваш платёж отправлен на проверку администратору.\n"
         "Ожидайте подтверждения."
     )
-    
+
     # Отправляем админам
     admin_text = (
         f"🆕 <b>Новый платёж #{payment.id}</b>\n\n"
         f"👤 <b>Пользователь:</b> {user.full_name}\n"
         f"🆔 <b>Username:</b> @{user.username or 'нет'}\n"
-        f"🔢 <b>Telegram ID:</b> <code>{user.telegram_id}</code>"
+        f"🔢 <b>Telegram ID:</b> <code>{user.telegram_id}</code>\n"
+        f"🔄 <b>Забанен в канале:</b> {'да' if user.is_banned else 'нет'}"
     )
     
     for admin_id in settings.admin_ids:
@@ -114,7 +140,7 @@ async def process_payment_photo(message: Message, session: AsyncSession, state: 
                 chat_id=admin_id,
                 photo=photo_file_id,
                 caption=admin_text,
-                reply_markup=get_admin_review_keyboard(payment.id)
+                reply_markup=get_admin_review_keyboard(payment.id),
             )
         except Exception as e:
             print(f"Не удалось отправить админу {admin_id}: {e}")

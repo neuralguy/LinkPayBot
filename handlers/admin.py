@@ -1,3 +1,5 @@
+from datetime import datetime, timedelta, timezone
+
 from aiogram import Router, F, Bot
 from aiogram.types import Message, CallbackQuery
 from aiogram.filters import Command
@@ -178,31 +180,61 @@ async def approve_payment(callback: CallbackQuery, session: AsyncSession, bot: B
         return
     
     payment.status = "approved"
-    await session.commit()
-    
+
     # Получаем пользователя
     result = await session.execute(select(User).where(User.id == payment.user_id))
     user = result.scalar_one()
-    
+
+    # === ПРОДЛЕНИЕ ПОДПИСКИ ===
+    now = datetime.now(timezone.utc)
+
+    # Если подписка ещё активна — продлеваем от текущего конца, иначе от сейчас
+    if user.subscription_until and user.subscription_until > now:
+        new_until = user.subscription_until + timedelta(days=settings.subscription_days)
+    else:
+        new_until = now + timedelta(days=settings.subscription_days)
+
+    user.subscription_until = new_until
+
+    # === РАЗБАН, если пользователь был забанен ===
+    if user.is_banned:
+        try:
+            await bot.unban_chat_member(
+                chat_id=settings.channel_id,
+                user_id=user.telegram_id,
+                only_if_banned=True,
+            )
+            user.is_banned = False
+        except Exception as e:
+            await callback.message.answer(
+                f"⚠️ Не удалось разбанить пользователя в канале: {e}"
+            )
+
+    await session.commit()
+
     await callback.answer("✅ Платёж одобрен!")
-    
+
     # Обновляем сообщение у админа
     await callback.message.edit_caption(
         caption=callback.message.caption + "\n\n✅ <b>ОДОБРЕНО</b>"
     )
-    
-    # Отправляем пользователю ссылку
+
+    # Отправляем пользователю ссылку и информацию о подписке
+    expire_str = new_until.strftime("%d.%m.%Y %H:%M UTC")
     try:
         await bot.send_message(
             chat_id=user.telegram_id,
             text=(
                 "🎉 <b>Ваш платёж подтверждён!</b>\n\n"
+                f"Подписка активна до: <b>{expire_str}</b>\n\n"
                 f"Добро пожаловать! Вот ваша ссылка для доступа:\n"
                 f"{settings.invite_link}"
-            )
+            ),
         )
     except Exception as e:
-        await callback.message.answer(f"⚠️ Не удалось отправить сообщение пользователю: {e}")
+        await callback.message.answer(
+            f"⚠️ Не удалось отправить сообщение пользователю: {e}"
+        )
 
 
 @router.callback_query(F.data.startswith("reject_"))
