@@ -31,7 +31,6 @@ async def get_or_create_user(
         await session.commit()
         await session.refresh(user)
     else:
-        # Обновляем имя/юзернейм на случай, если изменились
         user.username = username
         user.full_name = full_name
         await session.commit()
@@ -50,38 +49,54 @@ async def get_setting(session: AsyncSession, key: str) -> str:
 @router.message(CommandStart())
 async def cmd_start(message: Message, session: AsyncSession, state: FSMContext):
     await state.clear()
-    
+
     user = await get_or_create_user(
         session,
         message.from_user.id,
         message.from_user.username,
         message.from_user.full_name
     )
-    
+
     card_number = await get_setting(session, "card_number")
     phone_number = await get_setting(session, "phone_number")
     amount = await get_setting(session, "amount")
+    start_message_template = await get_setting(session, "start_message")
 
-    # Показываем статус подписки, если есть
+    # Формируем блок статуса подписки
     now = datetime.now(timezone.utc)
     if user.subscription_until and user.subscription_until > now:
         expire_str = user.subscription_until.strftime("%d.%m.%Y %H:%M UTC")
         sub_info = (
             f"✅ <b>У вас активная подписка</b> до <b>{expire_str}</b>\n\n"
-            f"Вы можете продлить подписку заранее — новый срок прибавится к текущему.\n\n"
+            f"Вы можете продлить подписку заранее — новый срок прибавится к текущему."
         )
     else:
-        sub_info = "❌ <b>У вас нет активной подписки.</b>\n\n"
+        sub_info = "❌ <b>У вас нет активной подписки.</b>"
 
-    text = (
-        f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
-        f"{sub_info}"
-        f"📋 <b>Информация для оплаты подписки на месяц:</b>\n\n"
-        f"💳 <b>Номер карты:</b>\n<code>{card_number}</code>\n\n"
-        f"📱 <b>Номер телефона:</b>\n<code>{phone_number}</code>\n\n"
-        f"💰 <b>Сумма к оплате:</b> <b>{amount} ₽</b>\n\n"
-        f"После оплаты нажмите кнопку ниже и отправьте скриншот/фото чека."
-    )
+    # Если шаблон есть — подставляем переменные, иначе fallback
+    if start_message_template:
+        try:
+            text = start_message_template.format(
+                first_name=message.from_user.first_name,
+                sub_info=sub_info,
+                card_number=card_number,
+                phone_number=phone_number,
+                amount=amount,
+            )
+        except (KeyError, ValueError, IndexError):
+            # Если шаблон сломан — показываем как есть без подстановки
+            text = start_message_template
+    else:
+        # Fallback на случай если настройки нет
+        text = (
+            f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
+            f"{sub_info}\n\n"
+            f"📋 <b>Информация для оплаты подписки на месяц:</b>\n\n"
+            f"💳 <b>Номер карты:</b>\n<code>{card_number}</code>\n\n"
+            f"📱 <b>Номер телефона:</b>\n<code>{phone_number}</code>\n\n"
+            f"💰 <b>Сумма к оплате:</b> <b>{amount} ₽</b>\n\n"
+            f"После оплаты нажмите кнопку ниже и отправьте скриншот/фото чека."
+        )
 
     await message.answer(text, reply_markup=get_payment_confirm_keyboard())
 
@@ -90,7 +105,7 @@ async def cmd_start(message: Message, session: AsyncSession, state: FSMContext):
 async def payment_confirm_callback(callback: CallbackQuery, state: FSMContext):
     await callback.answer()
     await state.set_state(PaymentStates.waiting_for_photo)
-    
+
     await callback.message.answer(
         "📸 <b>Отправьте фото/скриншот оплаты</b>\n\n"
         "Мы проверим платёж и отправим вам ссылку на доступ."
@@ -105,11 +120,9 @@ async def process_payment_photo(message: Message, session: AsyncSession, state: 
         message.from_user.username,
         message.from_user.full_name
     )
-    
-    # Получаем file_id самого большого фото
+
     photo_file_id = message.photo[-1].file_id
-    
-    # Сохраняем платёж
+
     payment = Payment(
         user_id=user.id, photo_file_id=photo_file_id, status="pending"
     )
@@ -125,7 +138,6 @@ async def process_payment_photo(message: Message, session: AsyncSession, state: 
         "Ожидайте подтверждения."
     )
 
-    # Отправляем админам
     admin_text = (
         f"🆕 <b>Новый платёж #{payment.id}</b>\n\n"
         f"👤 <b>Пользователь:</b> {user.full_name}\n"
@@ -133,7 +145,7 @@ async def process_payment_photo(message: Message, session: AsyncSession, state: 
         f"🔢 <b>Telegram ID:</b> <code>{user.telegram_id}</code>\n"
         f"🔄 <b>Забанен в канале:</b> {'да' if user.is_banned else 'нет'}"
     )
-    
+
     for admin_id in settings.admin_ids:
         try:
             await bot.send_photo(
@@ -151,3 +163,4 @@ async def process_payment_not_photo(message: Message):
     await message.answer(
         "⚠️ <b>Пожалуйста, отправьте именно фото/скриншот оплаты.</b>"
     )
+

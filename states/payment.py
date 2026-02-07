@@ -9,3 +9,6 @@ class AdminStates(StatesGroup):
     editing_card = State()
     editing_phone = State()
     editing_amount = State()
+    adding_admin = State()
+    editing_start_message = State()
+

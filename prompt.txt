@@ -1,0 +1,893 @@
+============================================================
+PROJECT STRUCTURE
+============================================================
+OplataLinkBot/
+├── __pycache__
+├── database
+│   ├── __pycache__
+│   ├── __init__.py
+│   ├── db.py
+│   └── models.py
+├── handlers
+│   ├── __pycache__
+│   ├── __init__.py
+│   ├── admin.py
+│   └── user.py
+├── keyboards
+│   ├── __pycache__
+│   ├── __init__.py
+│   └── inline.py
+├── middlewares
+│   ├── __pycache__
+│   ├── __init__.py
+│   └── db.py
+├── states
+│   ├── __pycache__
+│   ├── __init__.py
+│   └── payment.py
+├── __init__.py
+├── bot.db
+├── config.py
+├── main.py
+├── requirements.txt
+└── scheduler.py
+
+============================================================
+CODE FILES CONTENT
+============================================================
+
+────────────────────────────────────────
+📄 __init__.py
+────────────────────────────────────────
+
+
+────────────────────────────────────────
+📄 config.py
+────────────────────────────────────────
+from dataclasses import dataclass, field
+from os import getenv
+from dotenv import load_dotenv
+
+load_dotenv()
+
+
+@dataclass
+class Settings:
+    bot_token: str = "7778895037:AAEUeDd9nkpajQdag5F_CrFtDM9ZO49GcD8"
+    #bot_token: str = "8222451607:AAEORfrBFlnMEFfFeLD7zP46eGDksmvBhzo" # test
+    admin_ids: list[int] = field(default_factory=lambda: [516179955])
+    database_url: str = "sqlite+aiosqlite:///./bot.db"
+    invite_link: str = "https://t.me/+wCwzxVgd4pliYTFi"
+    # ID канала (числовой, например -1001234567890). Бот должен быть админом канала!
+    channel_id: int = -1001234567890
+    # Длительность подписки в днях
+    subscription_days: int = 30
+
+
+settings = Settings()
+
+
+────────────────────────────────────────
+📄 database/__init__.py
+────────────────────────────────────────
+from database.models import Base, User, Payment, BotSettings
+from database.db import init_db, get_session_maker
+
+__all__ = ["Base", "User", "Payment", "BotSettings", "init_db", "get_session_maker"]
+
+
+────────────────────────────────────────
+📄 database/db.py
+────────────────────────────────────────
+from sqlalchemy.ext.asyncio import create_async_engine, async_sessionmaker, AsyncSession
+from sqlalchemy import select
+
+from config import settings
+from database.models import Base, BotSettings
+
+
+async def init_db() -> async_sessionmaker[AsyncSession]:
+    engine = create_async_engine(settings.database_url, echo=False)
+
+    async with engine.begin() as conn:
+        await conn.run_sync(Base.metadata.create_all)
+
+    session_maker = async_sessionmaker(engine, expire_on_commit=False)
+
+    async with session_maker() as session:
+        await init_default_settings(session)
+
+    return session_maker
+
+
+async def init_default_settings(session: AsyncSession):
+    defaults = {
+        "card_number": "0000 0000 0000 0000",
+        "phone_number": "+7 (000) 000-00-00",
+        "amount": "1000",
+    }
+
+    for key, value in defaults.items():
+        result = await session.execute(
+            select(BotSettings).where(BotSettings.key == key)
+        )
+        if not result.scalar_one_or_none():
+            session.add(BotSettings(key=key, value=value))
+
+    await session.commit()
+
+
+def get_session_maker():
+    pass
+
+
+────────────────────────────────────────
+📄 database/models.py
+────────────────────────────────────────
+from datetime import datetime
+from sqlalchemy import BigInteger, String, Integer, DateTime, ForeignKey, Text, Boolean, func
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+
+
+class Base(DeclarativeBase):
+    pass
+
+
+class User(Base):
+    __tablename__ = "users"
+
+    id: Mapped[int] = mapped_column(primary_key=True)
+    telegram_id: Mapped[int] = mapped_column(BigInteger, unique=True, index=True)
+    username: Mapped[str | None] = mapped_column(String(255), nullable=True)
+    full_name: Mapped[str] = mapped_column(String(255))
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+
+    # Дата окончания подписки (None = нет активной подписки)
+    subscription_until: Mapped[datetime | None] = mapped_column(DateTime, nullable=True)
+    # Забанен ли в канале (чтобы знать, что надо разбанить при новой оплате)
+    is_banned: Mapped[bool] = mapped_column(Boolean, default=False, server_default="0")
+
+    payments: Mapped[list["Payment"]] = relationship(back_populates="user")
+
+
+class Payment(Base):
+    __tablename__ = "payments"
+    
+    id: Mapped[int] = mapped_column(primary_key=True)
+    user_id: Mapped[int] = mapped_column(ForeignKey("users.id"))
+    photo_file_id: Mapped[str] = mapped_column(Text)
+    status: Mapped[str] = mapped_column(String(50), default="pending")  # pending, approved, rejected
+    created_at: Mapped[datetime] = mapped_column(DateTime, server_default=func.now())
+    updated_at: Mapped[datetime | None] = mapped_column(DateTime, onupdate=func.now(), nullable=True)
+    
+    user: Mapped["User"] = relationship(back_populates="payments")
+
+
+class BotSettings(Base):
+    __tablename__ = "bot_settings"
+    
+    id: Mapped[int] = mapped_column(primary_key=True)
+    key: Mapped[str] = mapped_column(String(100), unique=True, index=True)
+    value: Mapped[str] = mapped_column(Text)
+
+
+────────────────────────────────────────
+📄 handlers/__init__.py
+────────────────────────────────────────
+
+
+────────────────────────────────────────
+📄 handlers/admin.py
+────────────────────────────────────────
+from datetime import datetime, timedelta, timezone
+
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import Command
+from aiogram.fsm.context import FSMContext
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from database.models import Payment, User, BotSettings
+from states.payment import AdminStates
+from keyboards.inline import get_admin_settings_keyboard, get_cancel_keyboard
+from config import settings
+
+router = Router()
+
+
+def is_admin(user_id: int) -> bool:
+    return user_id in settings.admin_ids
+
+
+@router.message(Command("admin"))
+async def cmd_admin(message: Message):
+    if not is_admin(message.from_user.id):
+        return
+    
+    await message.answer(
+        "⚙️ <b>Панель администратора</b>\n\n"
+        "Выберите параметр для редактирования:",
+        reply_markup=get_admin_settings_keyboard()
+    )
+
+
+@router.callback_query(F.data == "edit_card")
+async def edit_card_callback(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    result = await session.execute(select(BotSettings).where(BotSettings.key == "card_number"))
+    setting = result.scalar_one_or_none()
+    current = setting.value if setting else "не задано"
+    
+    await state.set_state(AdminStates.editing_card)
+    await callback.message.answer(
+        f"💳 <b>Текущий номер карты:</b>\n<code>{current}</code>\n\n"
+        "Отправьте новый номер карты:",
+        reply_markup=get_cancel_keyboard()
+    )
+
+
+@router.callback_query(F.data == "edit_phone")
+async def edit_phone_callback(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    result = await session.execute(select(BotSettings).where(BotSettings.key == "phone_number"))
+    setting = result.scalar_one_or_none()
+    current = setting.value if setting else "не задано"
+    
+    await state.set_state(AdminStates.editing_phone)
+    await callback.message.answer(
+        f"📱 <b>Текущий номер телефона:</b>\n<code>{current}</code>\n\n"
+        "Отправьте новый номер телефона:",
+        reply_markup=get_cancel_keyboard()
+    )
+
+
+@router.callback_query(F.data == "edit_amount")
+async def edit_amount_callback(callback: CallbackQuery, state: FSMContext, session: AsyncSession):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    await callback.answer()
+    
+    result = await session.execute(select(BotSettings).where(BotSettings.key == "amount"))
+    setting = result.scalar_one_or_none()
+    current = setting.value if setting else "не задано"
+    
+    await state.set_state(AdminStates.editing_amount)
+    await callback.message.answer(
+        f"💰 <b>Текущая сумма:</b> {current} ₽\n\n"
+        "Отправьте новую сумму (только число):",
+        reply_markup=get_cancel_keyboard()
+    )
+
+
+@router.callback_query(F.data == "cancel")
+async def cancel_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.clear()
+    await callback.message.answer("❌ Действие отменено.")
+
+
+async def update_setting(session: AsyncSession, key: str, value: str):
+    result = await session.execute(select(BotSettings).where(BotSettings.key == key))
+    setting = result.scalar_one_or_none()
+    
+    if setting:
+        setting.value = value
+    else:
+        session.add(BotSettings(key=key, value=value))
+    
+    await session.commit()
+
+
+@router.message(AdminStates.editing_card)
+async def process_edit_card(message: Message, session: AsyncSession, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    await update_setting(session, "card_number", message.text.strip())
+    await state.clear()
+    
+    await message.answer(
+        f"✅ <b>Номер карты обновлён:</b>\n<code>{message.text.strip()}</code>",
+        reply_markup=get_admin_settings_keyboard()
+    )
+
+
+@router.message(AdminStates.editing_phone)
+async def process_edit_phone(message: Message, session: AsyncSession, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    await update_setting(session, "phone_number", message.text.strip())
+    await state.clear()
+    
+    await message.answer(
+        f"✅ <b>Номер телефона обновлён:</b>\n<code>{message.text.strip()}</code>",
+        reply_markup=get_admin_settings_keyboard()
+    )
+
+
+@router.message(AdminStates.editing_amount)
+async def process_edit_amount(message: Message, session: AsyncSession, state: FSMContext):
+    if not is_admin(message.from_user.id):
+        return
+    
+    try:
+        amount = int(message.text.strip())
+    except ValueError:
+        await message.answer("⚠️ Введите корректное число.")
+        return
+    
+    await update_setting(session, "amount", str(amount))
+    await state.clear()
+    
+    await message.answer(
+        f"✅ <b>Сумма обновлена:</b> {amount} ₽",
+        reply_markup=get_admin_settings_keyboard()
+    )
+
+
+@router.callback_query(F.data.startswith("approve_"))
+async def approve_payment(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    payment_id = int(callback.data.split("_")[1])
+    
+    result = await session.execute(
+        select(Payment).where(Payment.id == payment_id)
+    )
+    payment = result.scalar_one_or_none()
+    
+    if not payment:
+        await callback.answer("Платёж не найден", show_alert=True)
+        return
+    
+    if payment.status != "pending":
+        await callback.answer("Платёж уже обработан", show_alert=True)
+        return
+    
+    payment.status = "approved"
+
+    # Получаем пользователя
+    result = await session.execute(select(User).where(User.id == payment.user_id))
+    user = result.scalar_one()
+
+    # === ПРОДЛЕНИЕ ПОДПИСКИ ===
+    now = datetime.now(timezone.utc)
+
+    # Если подписка ещё активна — продлеваем от текущего конца, иначе от сейчас
+    if user.subscription_until and user.subscription_until > now:
+        new_until = user.subscription_until + timedelta(days=settings.subscription_days)
+    else:
+        new_until = now + timedelta(days=settings.subscription_days)
+
+    user.subscription_until = new_until
+
+    # === РАЗБАН, если пользователь был забанен ===
+    if user.is_banned:
+        try:
+            await bot.unban_chat_member(
+                chat_id=settings.channel_id,
+                user_id=user.telegram_id,
+                only_if_banned=True,
+            )
+            user.is_banned = False
+        except Exception as e:
+            await callback.message.answer(
+                f"⚠️ Не удалось разбанить пользователя в канале: {e}"
+            )
+
+    await session.commit()
+
+    await callback.answer("✅ Платёж одобрен!")
+
+    # Обновляем сообщение у админа
+    await callback.message.edit_caption(
+        caption=callback.message.caption + "\n\n✅ <b>ОДОБРЕНО</b>"
+    )
+
+    # Отправляем пользователю ссылку и информацию о подписке
+    expire_str = new_until.strftime("%d.%m.%Y %H:%M UTC")
+    try:
+        await bot.send_message(
+            chat_id=user.telegram_id,
+            text=(
+                "🎉 <b>Ваш платёж подтверждён!</b>\n\n"
+                f"Подписка активна до: <b>{expire_str}</b>\n\n"
+                f"Добро пожаловать! Вот ваша ссылка для доступа:\n"
+                f"{settings.invite_link}"
+            ),
+        )
+    except Exception as e:
+        await callback.message.answer(
+            f"⚠️ Не удалось отправить сообщение пользователю: {e}"
+        )
+
+
+@router.callback_query(F.data.startswith("reject_"))
+async def reject_payment(callback: CallbackQuery, session: AsyncSession, bot: Bot):
+    if not is_admin(callback.from_user.id):
+        await callback.answer("Нет доступа", show_alert=True)
+        return
+    
+    payment_id = int(callback.data.split("_")[1])
+    
+    result = await session.execute(
+        select(Payment).where(Payment.id == payment_id)
+    )
+    payment = result.scalar_one_or_none()
+    
+    if not payment:
+        await callback.answer("Платёж не найден", show_alert=True)
+        return
+    
+    if payment.status != "pending":
+        await callback.answer("Платёж уже обработан", show_alert=True)
+        return
+    
+    payment.status = "rejected"
+    await session.commit()
+    
+    # Получаем пользователя
+    result = await session.execute(select(User).where(User.id == payment.user_id))
+    user = result.scalar_one()
+    
+    await callback.answer("❌ Платёж отклонён!")
+    
+    # Обновляем сообщение у админа
+    await callback.message.edit_caption(
+        caption=callback.message.caption + "\n\n❌ <b>ОТКЛОНЕНО</b>"
+    )
+    
+    # Уведомляем пользователя
+    try:
+        await bot.send_message(
+            chat_id=user.telegram_id,
+            text=(
+                "❌ <b>Ваш платёж отклонён.</b>\n\n"
+                "Пожалуйста, проверьте правильность оплаты и попробуйте снова.\n"
+                "Используйте /start для повторной попытки."
+            )
+        )
+    except Exception as e:
+        await callback.message.answer(f"⚠️ Не удалось отправить сообщение пользователю: {e}")
+
+
+────────────────────────────────────────
+📄 handlers/user.py
+────────────────────────────────────────
+from datetime import datetime, timezone
+
+from aiogram import Router, F, Bot
+from aiogram.types import Message, CallbackQuery
+from aiogram.filters import CommandStart
+from aiogram.fsm.context import FSMContext
+from sqlalchemy.ext.asyncio import AsyncSession
+from sqlalchemy import select
+
+from database.models import User, Payment, BotSettings
+from states.payment import PaymentStates
+from keyboards.inline import get_payment_confirm_keyboard, get_admin_review_keyboard
+from config import settings
+
+router = Router()
+
+
+async def get_or_create_user(
+    session: AsyncSession, telegram_id: int, username: str | None, full_name: str
+) -> User:
+    result = await session.execute(
+        select(User).where(User.telegram_id == telegram_id)
+    )
+    user = result.scalar_one_or_none()
+
+    if not user:
+        user = User(
+            telegram_id=telegram_id, username=username, full_name=full_name
+        )
+        session.add(user)
+        await session.commit()
+        await session.refresh(user)
+    else:
+        # Обновляем имя/юзернейм на случай, если изменились
+        user.username = username
+        user.full_name = full_name
+        await session.commit()
+
+    return user
+
+
+async def get_setting(session: AsyncSession, key: str) -> str:
+    result = await session.execute(
+        select(BotSettings).where(BotSettings.key == key)
+    )
+    setting = result.scalar_one_or_none()
+    return setting.value if setting else ""
+
+
+@router.message(CommandStart())
+async def cmd_start(message: Message, session: AsyncSession, state: FSMContext):
+    await state.clear()
+    
+    user = await get_or_create_user(
+        session,
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.full_name
+    )
+    
+    card_number = await get_setting(session, "card_number")
+    phone_number = await get_setting(session, "phone_number")
+    amount = await get_setting(session, "amount")
+
+    # Показываем статус подписки, если есть
+    now = datetime.now(timezone.utc)
+    if user.subscription_until and user.subscription_until > now:
+        expire_str = user.subscription_until.strftime("%d.%m.%Y %H:%M UTC")
+        sub_info = (
+            f"✅ <b>У вас активная подписка</b> до <b>{expire_str}</b>\n\n"
+            f"Вы можете продлить подписку заранее — новый срок прибавится к текущему.\n\n"
+        )
+    else:
+        sub_info = "❌ <b>У вас нет активной подписки.</b>\n\n"
+
+    text = (
+        f"👋 Привет, <b>{message.from_user.first_name}</b>!\n\n"
+        f"{sub_info}"
+        f"📋 <b>Информация для оплаты подписки на месяц:</b>\n\n"
+        f"💳 <b>Номер карты:</b>\n<code>{card_number}</code>\n\n"
+        f"📱 <b>Номер телефона:</b>\n<code>{phone_number}</code>\n\n"
+        f"💰 <b>Сумма к оплате:</b> <b>{amount} ₽</b>\n\n"
+        f"После оплаты нажмите кнопку ниже и отправьте скриншот/фото чека."
+    )
+
+    await message.answer(text, reply_markup=get_payment_confirm_keyboard())
+
+
+@router.callback_query(F.data == "payment_confirm")
+async def payment_confirm_callback(callback: CallbackQuery, state: FSMContext):
+    await callback.answer()
+    await state.set_state(PaymentStates.waiting_for_photo)
+    
+    await callback.message.answer(
+        "📸 <b>Отправьте фото/скриншот оплаты</b>\n\n"
+        "Мы проверим платёж и отправим вам ссылку на доступ."
+    )
+
+
+@router.message(PaymentStates.waiting_for_photo, F.photo)
+async def process_payment_photo(message: Message, session: AsyncSession, state: FSMContext, bot: Bot):
+    user = await get_or_create_user(
+        session,
+        message.from_user.id,
+        message.from_user.username,
+        message.from_user.full_name
+    )
+    
+    # Получаем file_id самого большого фото
+    photo_file_id = message.photo[-1].file_id
+    
+    # Сохраняем платёж
+    payment = Payment(
+        user_id=user.id, photo_file_id=photo_file_id, status="pending"
+    )
+    session.add(payment)
+    await session.commit()
+    await session.refresh(payment)
+
+    await state.clear()
+
+    await message.answer(
+        "✅ <b>Фото получено!</b>\n\n"
+        "Ваш платёж отправлен на проверку администратору.\n"
+        "Ожидайте подтверждения."
+    )
+
+    # Отправляем админам
+    admin_text = (
+        f"🆕 <b>Новый платёж #{payment.id}</b>\n\n"
+        f"👤 <b>Пользователь:</b> {user.full_name}\n"
+        f"🆔 <b>Username:</b> @{user.username or 'нет'}\n"
+        f"🔢 <b>Telegram ID:</b> <code>{user.telegram_id}</code>\n"
+        f"🔄 <b>Забанен в канале:</b> {'да' if user.is_banned else 'нет'}"
+    )
+    
+    for admin_id in settings.admin_ids:
+        try:
+            await bot.send_photo(
+                chat_id=admin_id,
+                photo=photo_file_id,
+                caption=admin_text,
+                reply_markup=get_admin_review_keyboard(payment.id),
+            )
+        except Exception as e:
+            print(f"Не удалось отправить админу {admin_id}: {e}")
+
+
+@router.message(PaymentStates.waiting_for_photo)
+async def process_payment_not_photo(message: Message):
+    await message.answer(
+        "⚠️ <b>Пожалуйста, отправьте именно фото/скриншот оплаты.</b>"
+    )
+
+
+────────────────────────────────────────
+📄 keyboards/__init__.py
+────────────────────────────────────────
+
+
+────────────────────────────────────────
+📄 keyboards/inline.py
+────────────────────────────────────────
+from aiogram.types import InlineKeyboardMarkup, InlineKeyboardButton
+from aiogram.utils.keyboard import InlineKeyboardBuilder
+
+
+def get_payment_confirm_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(
+        text="✅ Я оплатил",
+        callback_data="payment_confirm"
+    ))
+    return builder.as_markup()
+
+
+def get_admin_review_keyboard(payment_id: int) -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(
+            text="✅ Одобрить",
+            callback_data=f"approve_{payment_id}"
+        ),
+        InlineKeyboardButton(
+            text="❌ Отклонить",
+            callback_data=f"reject_{payment_id}"
+        )
+    )
+    return builder.as_markup()
+
+
+def get_admin_settings_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.row(
+        InlineKeyboardButton(text="💳 Номер карты", callback_data="edit_card")
+    )
+    builder.row(
+        InlineKeyboardButton(text="📱 Номер телефона", callback_data="edit_phone")
+    )
+    builder.row(
+        InlineKeyboardButton(text="💰 Сумма", callback_data="edit_amount")
+    )
+    return builder.as_markup()
+
+
+def get_cancel_keyboard() -> InlineKeyboardMarkup:
+    builder = InlineKeyboardBuilder()
+    builder.add(InlineKeyboardButton(text="❌ Отмена", callback_data="cancel"))
+    return builder.as_markup()
+
+
+────────────────────────────────────────
+📄 main.py
+────────────────────────────────────────
+import asyncio
+import logging
+
+from aiogram import Bot, Dispatcher
+from aiogram.client.default import DefaultBotProperties
+from aiogram.enums import ParseMode
+from aiogram.fsm.storage.memory import MemoryStorage
+from apscheduler.schedulers.asyncio import AsyncIOScheduler
+
+from config import settings
+from database.db import init_db
+from handlers import user, admin
+from middlewares.db import DbSessionMiddleware
+from scheduler import check_expired_subscriptions
+
+
+async def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+    )
+
+    session_maker = await init_db()
+
+    bot = Bot(
+        token=settings.bot_token,
+        default=DefaultBotProperties(parse_mode=ParseMode.HTML),
+    )
+
+    dp = Dispatcher(storage=MemoryStorage())
+
+    dp.update.middleware(DbSessionMiddleware(session_maker))
+
+    dp.include_router(admin.router)
+    dp.include_router(user.router)
+
+    # === ПЛАНИРОВЩИК: проверка подписок каждые 60 минут ===
+    scheduler = AsyncIOScheduler(timezone="UTC")
+    scheduler.add_job(
+        check_expired_subscriptions,
+        trigger="interval",
+        minutes=60,
+        args=[bot, session_maker],
+        id="check_subscriptions",
+        replace_existing=True,
+    )
+    scheduler.start()
+    logging.info("Планировщик запущен — проверка подписок каждые 60 минут")
+
+    logging.info("Бот запущен")
+    await bot.delete_webhook(drop_pending_updates=True)
+    await dp.start_polling(bot)
+
+
+if __name__ == "__main__":
+    asyncio.run(main())
+
+
+────────────────────────────────────────
+📄 middlewares/__init__.py
+────────────────────────────────────────
+
+
+────────────────────────────────────────
+📄 middlewares/db.py
+────────────────────────────────────────
+from typing import Callable, Dict, Any, Awaitable
+
+from aiogram import BaseMiddleware
+from aiogram.types import TelegramObject
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+
+class DbSessionMiddleware(BaseMiddleware):
+    def __init__(self, session_maker: async_sessionmaker):
+        self.session_maker = session_maker
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, Dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: Dict[str, Any],
+    ) -> Any:
+        async with self.session_maker() as session:
+            data["session"] = session
+            return await handler(event, data)
+
+
+────────────────────────────────────────
+📄 requirements.txt
+────────────────────────────────────────
+aiogram>=3.24.0
+sqlalchemy>=2.0.0
+aiosqlite>=0.20.0
+apscheduler>=3.10.0
+dotenv>=1.0.0
+
+
+────────────────────────────────────────
+📄 scheduler.py
+────────────────────────────────────────
+import logging
+from datetime import datetime, timezone
+
+from aiogram import Bot
+from aiogram.enums import ChatMemberStatus
+from sqlalchemy import select
+from sqlalchemy.ext.asyncio import async_sessionmaker
+
+from config import settings
+from database.models import User
+
+logger = logging.getLogger(__name__)
+
+
+async def check_expired_subscriptions(bot: Bot, session_maker: async_sessionmaker):
+    """
+    Проверяет всех пользователей с истёкшей подпиской.
+    Кикает их из канала и помечает как забаненных.
+    """
+    now = datetime.now(timezone.utc)
+
+    async with session_maker() as session:
+        # Ищем пользователей, у которых подписка истекла и они ещё не забанены
+        result = await session.execute(
+            select(User).where(
+                User.subscription_until.isnot(None),
+                User.subscription_until < now,
+                User.is_banned == False,
+            )
+        )
+        expired_users = result.scalars().all()
+
+        for user in expired_users:
+            try:
+                # Проверяем, состоит ли пользователь в канале
+                member = await bot.get_chat_member(
+                    chat_id=settings.channel_id,
+                    user_id=user.telegram_id
+                )
+
+                if member.status not in (
+                    ChatMemberStatus.LEFT,
+                    ChatMemberStatus.KICKED,
+                ):
+                    # Баним пользователя из канала (кик + бан, чтобы инвайт-ссылка не работала)
+                    await bot.ban_chat_member(
+                        chat_id=settings.channel_id,
+                        user_id=user.telegram_id,
+                    )
+                    logger.info(
+                        f"Забанен пользователь {user.telegram_id} ({user.full_name}) — подписка истекла"
+                    )
+
+                user.is_banned = True
+                user.subscription_until = None
+
+                # Уведомляем пользователя
+                try:
+                    await bot.send_message(
+                        chat_id=user.telegram_id,
+                        text=(
+                            "⏰ <b>Ваша подписка истекла!</b>\n\n"
+                            "Доступ к каналу заблокирован.\n"
+                            "Чтобы продлить подписку, нажмите /start и оплатите заново."
+                        ),
+                    )
+                except Exception:
+                    logger.warning(
+                        f"Не удалось уведомить пользователя {user.telegram_id}"
+                    )
+
+            except Exception as e:
+                logger.error(
+                    f"Ошибка при обработке пользователя {user.telegram_id}: {e}"
+                )
+
+        await session.commit()
+
+    if expired_users:
+        logger.info(f"Обработано {len(expired_users)} истёкших подписок")
+
+
+────────────────────────────────────────
+📄 states/__init__.py
+────────────────────────────────────────
+
+
+────────────────────────────────────────
+📄 states/payment.py
+────────────────────────────────────────
+from aiogram.fsm.state import State, StatesGroup
+
+
+class PaymentStates(StatesGroup):
+    waiting_for_photo = State()
+
+
+class AdminStates(StatesGroup):
+    editing_card = State()
+    editing_phone = State()
+    editing_amount = State()
+
+
+============================================================
+SERVICE FILES
+============================================================
